@@ -1,6 +1,6 @@
 import express from "express";
-import cors from "cors";
 import axios from "axios";
+import cors from "cors";
 import morgan from "morgan";
 import dotenv from "dotenv";
 
@@ -8,150 +8,163 @@ dotenv.config();
 
 const app = express();
 
-// ----------------------
-// 1. CONFIG + SECURITY
-// ----------------------
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.OPENROUTER_API_KEY;
-
-if (!API_KEY) {
-  console.error("❌ Missing OPENROUTER_API_KEY in .env");
-  process.exit(1);
-}
-
-const MODELS = {
-  deepseek: "deepseek/deepseek-r1:free",
-  llama: "meta-llama/llama-3.1-8b-instruct:free",
-  qwen: "qwen/qwen-2.5-coder-7b:free",
-};
-
-// ----------------------
-// 2. MIDDLEWARE
-// ----------------------
-app.use(cors({ origin: "*", methods: ["POST", "GET"] }));
+// Middlewares
 app.use(express.json({ limit: "1mb" }));
+app.use(cors());
 app.use(morgan("tiny"));
 
-// ----------------------
-// 3. ROOT ROUTE (HTML)
-// ----------------------
+// ENV
+const API_KEY = process.env.OPENROUTER_API_KEY;
+const PORT = process.env.PORT || 3000;
+
+if (!API_KEY) {
+  console.error("❌ OPENROUTER_API_KEY missing in .env");
+}
+
+// -------------------------------
+// ALL FREE MODELS (OpenRouter)
+// -------------------------------
+const MODELS = {
+  "deepseek-chat": "deepseek/deepseek-chat",
+  "qwen2.5-7b": "qwen/qwen2.5-7b-instruct",
+  "qwen2.5-14b": "qwen/qwen2.5-14b-instruct",
+  "llama3.2-3b": "meta-llama/llama-3.2-3b-instruct",
+  "llama3.1-8b": "meta-llama/llama-3.1-8b-instruct",
+  "gemma2-9b": "google/gemma-2-9b-it",
+  "phi3.5": "microsoft/phi-3.5-mini-instruct",
+  "mistral-nemo": "mistralai/mistral-nemo-instruct",
+  "nemotron-mini": "nvidia/nemotron-mini-4b-instruct",
+};
+
+// Fallback list (auto switch if a model fails)
+const FALLBACK_ORDER = [
+  "deepseek-chat",
+  "llama3.1-8b",
+  "gemma2-9b",
+  "qwen2.5-7b",
+  "phi3.5",
+];
+
+// -------------------------------
+// Root Route — HTML Tester
+// -------------------------------
 app.get("/", (req, res) => {
   res.send(`
-  <!DOCTYPE html>
-  <html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NGAI Chat Test</title>
-    <style>
-      body { font-family: Arial, sans-serif; background:#f4f4f4; padding:20px; }
-      .container { max-width:600px; margin:auto; background:white; padding:20px; border-radius:10px; }
-      textarea { width:100%; height:100px; margin-bottom:10px; padding:10px; font-size:16px; }
-      select, button { padding:10px; font-size:16px; margin-right:10px; }
-      #response { margin-top:20px; white-space:pre-wrap; background:#eee; padding:10px; border-radius:5px; }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <h1>NGAI Chat Backend Test</h1>
-      <textarea id="message" placeholder="Type your message..."></textarea>
-      <br>
-      <select id="model">
-        <option value="deepseek">DeepSeek</option>
-        <option value="llama">Meta Llama 3.1</option>
-        <option value="qwen">Qwen 2.5 Coder</option>
-      </select>
-      <button onclick="sendMessage()">Send</button>
-      <div id="response"></div>
-    </div>
-    <script>
-      async function sendMessage() {
-        const message = document.getElementById("message").value;
-        const model = document.getElementById("model").value;
-        const responseDiv = document.getElementById("response");
-        responseDiv.innerText = "Loading...";
+<html>
+  <body style="font-family: Arial; padding: 20px;">
+    <h2>NGAI Backend Tester</h2>
+    <textarea id="msg" rows="4" cols="50" placeholder="Type message..."></textarea><br><br>
+    <select id="model">
+      ${Object.keys(MODELS)
+        .map((m) => `<option value="${m}">${m}</option>`)
+        .join("")}
+    </select>
+    <button onclick="send()">Send</button>
 
-        try {
-          const res = await fetch("/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message, model })
-          });
+    <pre id="out" style="background:#eee; padding:10px; margin-top:20px;"></pre>
 
-          const data = await res.json();
-          if(res.ok) {
-            responseDiv.innerText = data.reply;
-          } else {
-            responseDiv.innerText = "Error: " + data.error;
-          }
-        } catch (err) {
-          responseDiv.innerText = "Error: " + err.message;
-        }
-      }
-    </script>
+<script>
+async function send() {
+  document.getElementById("out").innerText = "Loading...";
+  const res = await fetch("/chat", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      message: document.getElementById("msg").value,
+      model: document.getElementById("model").value
+    })
+  });
+  const data = await res.json();
+  document.getElementById("out").innerText = JSON.stringify(data, null, 2);
+}
+</script>
+
   </body>
-  </html>
-  `);
+</html>
+`);
 });
 
-// ----------------------
-// 4. CHAT ROUTE
-// ----------------------
-app.post("/chat", async (req, res) => {
-  const startTime = Date.now();
-
+// -------------------------------
+// Chat Endpoint (unbreakable)
+// -------------------------------
+async function callModel(modelKey, message) {
   try {
-    const { message, model } = req.body;
-
-    if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(400).json({ error: "Message is required" });
-    }
-
-    if (message.length > 10000) {
-      return res.status(400).json({ error: "Message too long" });
-    }
-
-    if (!model || !MODELS[model]) {
-      return res.status(400).json({ error: "Invalid or unknown model" });
-    }
-
     const response = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
-        model: MODELS[model],
+        model: MODELS[modelKey],
         messages: [{ role: "user", content: message }],
       },
       {
-        timeout: 25000,
+        timeout: 20000,
         headers: {
           Authorization: `Bearer ${API_KEY}`,
           "Content-Type": "application/json",
-          "HTTP-Referer": "https://ngai.app",
-          "X-Title": "NGAI Chat Backend",
         },
       }
     );
 
-    const reply = response.data?.choices?.[0]?.message?.content || "";
-
-    console.log(`Request processed in ${Date.now() - startTime}ms`);
-
-    return res.status(200).json({ reply });
-
+    return {
+      success: true,
+      reply: response.data?.choices?.[0]?.message?.content || "",
+    };
   } catch (err) {
-    const status = err.response?.status || 500;
-    const msg = err.response?.data?.error?.message || err.message;
-
-    console.error(`OpenRouter ${status}:`, msg);
-    console.log(`Request failed in ${Date.now() - startTime}ms`);
-
-    return res.status(500).json({ error: "Server error. Try again later." });
+    return {
+      success: false,
+      status: err.response?.status,
+      error: err.response?.data?.error?.message || err.message,
+    };
   }
+}
+
+app.post("/chat", async (req, res) => {
+  const start = Date.now();
+  const { message, model } = req.body;
+
+  // Validation
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "Message required" });
+  }
+  if (message.length > 10000) {
+    return res.status(400).json({ error: "Message too long" });
+  }
+  if (!model || !MODELS[model]) {
+    return res.status(400).json({ error: "Invalid model" });
+  }
+
+  // Try main model
+  let result = await callModel(model, message);
+
+  // Auto fallback if main fails
+  if (!result.success) {
+    console.log(`⚠️ Model failed: ${model}, switching...`);
+
+    for (const alt of FALLBACK_ORDER) {
+      if (alt === model) continue;
+      console.log(`➡️ Trying fallback: ${alt}`);
+
+      result = await callModel(alt, message);
+      if (result.success) break;
+    }
+  }
+
+  // If still failed
+  if (!result.success) {
+    return res.status(500).json({
+      error: "API failed after all fallbacks",
+      details: result.error,
+    });
+  }
+
+  console.log(`✔️ Request done in ${Date.now() - start}ms`);
+
+  return res.json({
+    reply: result.reply,
+    used: model,
+  });
 });
 
-// ----------------------
-// 5. START SERVER
-// ----------------------
-app.listen(PORT, () => {
-  console.log(`🚀 NGAI Backend running on port ${PORT}`);
-});
+// -------------------------------
+app.listen(PORT, () =>
+  console.log(`🚀 NGAI backend running on port ${PORT}`)
+);
